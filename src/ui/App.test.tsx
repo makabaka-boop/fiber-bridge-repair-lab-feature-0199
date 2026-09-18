@@ -1,5 +1,5 @@
 /// <reference types="vitest/globals" />
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { App } from './App';
 
@@ -15,6 +15,8 @@ const validJson = JSON.stringify({
 const inputBox = () => screen.getByLabelText('拓扑 JSON 输入') as HTMLTextAreaElement;
 const importButton = () => screen.getByRole('button', { name: '导入并分析' });
 const trialButton = () => screen.getByRole('button', { name: '试接并核对' });
+const batchBox = () => screen.getByLabelText('批量方案 JSON 输入') as HTMLTextAreaElement;
+const batchButton = () => screen.getByRole('button', { name: '批量筛选' });
 
 /** 读取“脆弱链路总数”统计卡数值（该卡始终随基线渲染，非法导入后也保留） */
 const fragileStatValue = () => {
@@ -22,6 +24,19 @@ const fragileStatValue = () => {
   const card = label.closest('.stat') as HTMLElement;
   return card.querySelector('.stat-value')?.textContent;
 };
+
+/** 读取批量结果区指定统计卡数值 */
+const batchStatValue = (label: string) => {
+  const el = screen.getByText(label);
+  const card = el.closest('.stat') as HTMLElement;
+  return card.querySelector('.stat-value')?.textContent;
+};
+
+/** 当前批量结果表的所有行（下标、端点 A、端点 B、可消除数量） */
+const batchRows = () =>
+  Array.from(document.querySelectorAll('.batch-table tbody tr')).map((tr) =>
+    Array.from(tr.querySelectorAll('td')).map((td) => td.textContent),
+  );
 
 async function importJson(text: string) {
   fireEvent.change(inputBox(), { target: { value: text } });
@@ -39,6 +54,12 @@ async function submitTrial(a: string, b: string) {
     expect(inputB.value).toBe(b);
   });
   fireEvent.click(trialButton());
+}
+
+async function submitBatch(text: string) {
+  fireEvent.change(batchBox(), { target: { value: text } });
+  await waitFor(() => expect(batchBox().value).toBe(text));
+  fireEvent.click(batchButton());
 }
 
 afterEach(cleanup);
@@ -121,5 +142,119 @@ describe('拓扑工作台 UI', () => {
     // 旧基线依旧保留（脆弱链路总数统计卡仍为 2，桥行仍在）
     expect(fragileStatValue()).toBe('2');
     expect(screen.getByText('L2')).toBeTruthy();
+  });
+});
+
+describe('批量方案筛选 UI', () => {
+  it('合法批次整体替换；末项非法按下标报错并保留上次结果', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    // 合法批次：含重复候选，按输入下标原序显示
+    await submitBatch('[{"a":"a","b":"c"},{"a":"a","b":"b"},{"a":"b","b":"c"},{"a":"a","b":"c"}]');
+    await waitFor(() => expect(batchStatValue('方案总数')).toBe('4'));
+    expect(batchStatValue('基线脆弱链路总数')).toBe('2');
+    expect(batchStatValue('可全消方案数')).toBe('2');
+    expect(batchRows()).toEqual([
+      ['0', 'a', 'c', '2'],
+      ['1', 'a', 'b', '1'],
+      ['2', 'b', 'c', '1'],
+      ['3', 'a', 'c', '2'],
+    ]);
+
+    // 末项非法（端点不存在）：按下标报错，上次结果完整保留
+    await submitBatch('[{"a":"a","b":"c"},{"a":"a","b":"ghost"}]');
+    await waitFor(() => expect(screen.getByText('批量导入被拒绝。')).toBeTruthy());
+    expect(screen.getByText(/下标 1/)).toBeTruthy();
+    expect(screen.getByText(/不在当前站点清单/)).toBeTruthy();
+    expect(batchRows()).toHaveLength(4);
+
+    // 空批次、额外字段同样整体拒绝且保留上次结果
+    await submitBatch('[]');
+    await waitFor(() => expect(screen.getByText(/空数组/)).toBeTruthy());
+    expect(batchRows()).toHaveLength(4);
+    await submitBatch('[{"a":"a","b":"c","note":"x"}]');
+    await waitFor(() => expect(screen.getByText(/额外字段/)).toBeTruthy());
+    expect(batchRows()).toHaveLength(4);
+
+    // 再次合法批次：整体替换旧结果
+    await submitBatch('[{"a":"a","b":"b"}]');
+    await waitFor(() => expect(batchStatValue('方案总数')).toBe('1'));
+    expect(batchRows()).toEqual([['0', 'a', 'b', '1']]);
+
+    // 批量操作不改写单次试接：试接仍正常
+    await submitTrial('a', 'c');
+    await waitFor(() => expect(screen.getByText(/已消除 2 条/)).toBeTruthy());
+    expect(batchStatValue('方案总数')).toBe('1');
+  });
+
+  it('合法新拓扑清空批量结果；非法导入保留批量结果', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+    await submitBatch('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(batchRows()).toHaveLength(1));
+
+    // 合法新拓扑（三角形，无桥）：旧批量结果清空
+    await importJson(
+      JSON.stringify({
+        sites: ['x', 'y', 'z'],
+        links: [
+          { id: 'r1', u: 'x', v: 'y' },
+          { id: 'r2', u: 'y', v: 'z' },
+          { id: 'r3', u: 'z', v: 'x' },
+        ],
+      }),
+    );
+    await waitFor(() => expect(fragileStatValue()).toBe('0'));
+    expect(document.querySelector('.batch-table')).toBeNull();
+
+    // 新拓扑上重新批量筛选（新站点编号）
+    await submitBatch('[{"a":"x","b":"z"}]');
+    await waitFor(() => expect(batchRows()).toEqual([['0', 'x', 'z', '0']]));
+
+    // 非法导入：保留当前拓扑与批量结果
+    await importJson('{坏的');
+    await waitFor(() => expect(screen.getByText('导入被拒绝，')).toBeTruthy());
+    expect(batchRows()).toEqual([['0', 'x', 'z', '0']]);
+  });
+
+  it('批量端点不存在与自环均按下标拒绝', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    await submitBatch('[{"a":"a","b":"a"}]');
+    await waitFor(() => expect(screen.getByText(/下标 0.*必须不同/)).toBeTruthy());
+    expect(document.querySelector('.batch-table')).toBeNull();
+
+    await submitBatch('[{"a":"a","b":"c"},{"a":"b","b":"c"},{"a":"c","b":"zzz"}]');
+    await waitFor(() => expect(screen.getByText(/下标 2/)).toBeTruthy());
+    expect(document.querySelector('.batch-table')).toBeNull();
+  });
+
+  it('大批量结果按输入下标分页显示', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    // 60 项：超过单页 50 条，触发分页
+    const items = Array.from({ length: 60 }, (_, i) => (i % 2 === 0 ? { a: 'a', b: 'c' } : { a: 'a', b: 'b' }));
+    await submitBatch(JSON.stringify(items));
+    await waitFor(() => expect(batchStatValue('方案总数')).toBe('60'));
+
+    // 第一页为下标 0–49
+    expect(batchRows()).toHaveLength(50);
+    expect(batchRows()[0]).toEqual(['0', 'a', 'c', '2']);
+    expect(batchRows()[49][0]).toBe('49');
+
+    // 翻到第二页：下标 50–59，计数仍与输入一一对应
+    const batchSection = screen.getByText('4. 批量方案筛选').closest('section') as HTMLElement;
+    fireEvent.click(within(batchSection).getByRole('button', { name: '下一页' }));
+    await waitFor(() => expect(batchRows()).toHaveLength(10));
+    expect(batchRows()[0]).toEqual(['50', 'a', 'c', '2']);
+    expect(batchRows()[9]).toEqual(['59', 'a', 'b', '1']);
+    expect(within(batchSection).getByText(/共 60 条/)).toBeTruthy();
   });
 });

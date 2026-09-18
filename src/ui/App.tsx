@@ -1,8 +1,8 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Analyzer } from '../core/analysis';
-import { parseTopology } from '../core/parse';
+import { parseBatchPlans, parseTopology } from '../core/parse';
 import { TopologyError } from '../core/types';
-import type { BaselineResult, NormalizedTopology, TrialResult } from '../core/types';
+import type { BaselineResult, BatchScreenResult, NormalizedTopology, TrialResult } from '../core/types';
 import { sampleTopology } from './sample';
 import { BridgeTable, Pagination, usePagination } from './BridgeTable';
 
@@ -22,6 +22,12 @@ interface TrialState {
   b: string;
 }
 
+interface BatchState {
+  /** 上次成功批量筛选结果；非法批量导入时保留不变 */
+  result: BatchScreenResult | null;
+  error: string | null;
+}
+
 export function App() {
   const [valid, setValid] = useState<ValidState | null>(null);
   const [rawText, setRawText] = useState('');
@@ -30,6 +36,7 @@ export function App() {
   const [fileName, setFileName] = useState<string | null>(null);
 
   const [trial, setTrial] = useState<TrialState | null>(null);
+  const [batch, setBatch] = useState<BatchState | null>(null);
 
   const loadTopology = useCallback((text: string, label: string | null) => {
     setImporting(true);
@@ -46,11 +53,12 @@ export function App() {
         });
         setImportError(null);
         setFileName(label);
-        // 新拓扑导入后旧试接不再适用，清空（基线本身不受历史试接影响）
+        // 新拓扑导入后旧试接与旧批量结果不再适用，清空（基线本身不受历史操作影响）
         setTrial(null);
+        setBatch(null);
       } catch (e) {
         const msg = e instanceof TopologyError ? e.message : `分析失败：${(e as Error).message}`;
-        setImportError(msg); // 保留 valid（上次有效拓扑）不变
+        setImportError(msg); // 保留 valid（上次有效拓扑）与既有试接/批量结果不变
       } finally {
         setImporting(false);
       }
@@ -85,6 +93,21 @@ export function App() {
       const msg = e instanceof TopologyError ? e.message : `试接失败：${(e as Error).message}`;
       // 非法试接：保留上次试接结果（若有），仅更新错误与当前输入
       setTrial((prev) => ({ result: prev?.result ?? null, error: msg, a, b }));
+    }
+  };
+
+  const onBatch = (text: string) => {
+    if (!valid) return;
+    try {
+      // 全批校验（结构/字段 → 端点存在且互异）全部通过后才生成结果
+      const pairs = parseBatchPlans(text);
+      const result = valid.analyzer.screenBatch(pairs);
+      // 成功：整体替换上次批量结果；基线与单次试接结果不受影响
+      setBatch({ result, error: null });
+    } catch (e) {
+      const msg = e instanceof TopologyError ? e.message : `批量筛选失败：${(e as Error).message}`;
+      // 非法批量导入：保留上次批量结果（若有），仅更新错误
+      setBatch((prev) => ({ result: prev?.result ?? null, error: msg }));
     }
   };
 
@@ -161,6 +184,11 @@ export function App() {
             trial={trial}
             onSubmit={onTrial}
             onDismissError={() => setTrial((p) => (p ? { ...p, error: null } : p))}
+          />
+          <BatchSection
+            batch={batch}
+            onSubmit={onBatch}
+            onDismissError={() => setBatch((p) => (p ? { ...p, error: null } : p))}
           />
         </>
       )}
@@ -308,6 +336,102 @@ function TrialSection({
               <Pagination page={removedPage} total={result.removed.length} />
             </>
           )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BatchSection({
+  batch,
+  onSubmit,
+  onDismissError,
+}: {
+  batch: BatchState | null;
+  onSubmit: (text: string) => void;
+  onDismissError: () => void;
+}) {
+  const [text, setText] = useState('');
+
+  // 仅当存在成功批量结果时展示；非法批量导入时 result 保持为上次结果
+  const result = batch?.result ?? null;
+  const page = usePagination(result?.items.length ?? 0, 'batch');
+  const slice = useMemo(
+    () => result?.items.slice(page.start, page.end) ?? [],
+    [result, page.start, page.end],
+  );
+  // 可全消方案数（基线无桥时无可消对象，记 0）
+  const fullClearCount = useMemo(
+    () =>
+      result && result.baselineCount > 0
+        ? result.items.filter((it) => it.removedCount === result.baselineCount).length
+        : 0,
+    [result],
+  );
+
+  return (
+    <section className="card">
+      <h2>4. 批量方案筛选</h2>
+      <p className="hint">
+        粘贴 1–100000 项的 JSON 数组，每项仅含 <code>{'{"a": "站点1", "b": "站点2"}'}</code> 两个字段
+        （编号规则同单次试接）。全批校验通过后按<strong>输入下标</strong>分页给出每项可消除的基线脆弱链路数量，
+        不展开链路清单；任一项非法则整批拒绝并保留上次结果。
+      </p>
+      <textarea
+        className="json-input"
+        aria-label="批量方案 JSON 输入"
+        rows={5}
+        placeholder='[{"a":"a","b":"c"}, {"a":"b","b":"c"}]'
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+      />
+      <div className="row">
+        <button className="primary" onClick={() => onSubmit(text)}>
+          批量筛选
+        </button>
+      </div>
+
+      {batch?.error && (
+        <div className="alert error" role="alert">
+          <strong>批量导入被拒绝。</strong> {result ? '上次批量结果保留如下。' : '尚无有效批量结果。'}
+          <div className="alert-detail">{batch.error}</div>
+          <button className="link" onClick={onDismissError}>
+            关闭提示
+          </button>
+        </div>
+      )}
+
+      {result && (
+        <div className="batch-result">
+          <div className="stat-row">
+            <Stat label="方案总数" value={result.items.length} />
+            <Stat label="基线脆弱链路总数" value={result.baselineCount} />
+            <Stat label="可全消方案数" value={fullClearCount} />
+          </div>
+          <div className="table-wrap">
+            <table className="bridge-table batch-table">
+              <thead>
+                <tr>
+                  <th className="col-rank">下标</th>
+                  <th className="col-endpoint">端点 A</th>
+                  <th className="col-endpoint">端点 B</th>
+                  <th className="col-side">可消除的基线脆弱链路数</th>
+                </tr>
+              </thead>
+              <tbody>
+                {slice.map((it) => (
+                  <tr key={it.index}>
+                    <td className="muted">{it.index}</td>
+                    <td className="mono">{it.a}</td>
+                    <td className="mono">{it.b}</td>
+                    <td className="num strong">{it.removedCount.toLocaleString('zh-CN')}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <Pagination page={page} total={result.items.length} />
         </div>
       )}
     </section>

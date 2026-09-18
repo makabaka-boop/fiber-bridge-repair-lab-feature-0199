@@ -13,8 +13,17 @@
  * Tarjan；试接在其结果上以独立缓冲派生，绝不改写基线。
  */
 import { compareUtf8 } from './utf8';
+import { MAX_BATCH_PAIRS } from './parse';
 import { TopologyError } from './types';
-import type { BaselineResult, BridgeInfo, NormalizedTopology, TrialResult } from './types';
+import type {
+  BaselineResult,
+  BatchPair,
+  BatchScreenItem,
+  BatchScreenResult,
+  BridgeInfo,
+  NormalizedTopology,
+  TrialResult,
+} from './types';
 
 interface PreparedGraph {
   n: number;
@@ -35,6 +44,8 @@ interface TarjanOutput {
   /** 桥 e 在 DFS 树中的子端点（非桥为 -1） */
   bridgeChild: Int32Array;
   subtree: Int32Array;
+  /** DFS 发现序：order[disc[v]] = v，保证父顶点先于子顶点出现 */
+  order: Int32Array;
 }
 
 function prepare(t: NormalizedTopology): PreparedGraph {
@@ -90,6 +101,7 @@ function tarjanBridges(g: PreparedGraph, m: number): TarjanOutput {
   const subtree = new Int32Array(n).fill(1);
   const isBridge = new Uint8Array(m);
   const bridgeChild = new Int32Array(m).fill(-1);
+  const order = new Int32Array(n);
   const nextCursor = new Int32Array(n); // 每个顶点下一条待考察邻接边
   const stack = new Int32Array(n);
 
@@ -97,6 +109,7 @@ function tarjanBridges(g: PreparedGraph, m: number): TarjanOutput {
   for (let root = 0; root < n; root++) {
     if (disc[root] !== -1) continue;
     disc[root] = low[root] = timer++;
+    order[disc[root]] = root;
     parentVertex[root] = -1;
     parentEdge[root] = -1;
     depth[root] = 0;
@@ -117,6 +130,7 @@ function tarjanBridges(g: PreparedGraph, m: number): TarjanOutput {
           parentEdge[w] = eid;
           depth[w] = depth[v] + 1;
           disc[w] = low[w] = timer++;
+          order[disc[w]] = w;
           stack[top++] = w;
         } else if (disc[w] < low[v]) {
           // 回边（含通向祖先的平行边）降低 low 值
@@ -138,18 +152,99 @@ function tarjanBridges(g: PreparedGraph, m: number): TarjanOutput {
       }
     }
   }
-  return { isBridge, bridgeChild, subtree };
+  return { isBridge, bridgeChild, subtree, order };
+}
+
+/**
+ * 只读批量索引：基于 Tarjan 父树与桥标记构建的桥前缀 + 二进制提升表。
+ * 构造一次后仅被读取，批量筛选与单次试接共享，绝不改写基线数据。
+ */
+interface LcaIndex {
+  /** DFS 树深度（根为 0），与 PreparedGraph.depth 共享同一缓冲 */
+  depth: Int32Array;
+  /** 桥前缀：根到 v 的树路径上的桥数量 */
+  bridgePrefix: Int32Array;
+  /** 扁平二进制提升表：up[k * n + v] 为 v 的第 2^k 个祖先（根的祖先为其自身） */
+  up: Int32Array;
+  levels: number;
+}
+
+/** 构建只读 LCA 索引：O(n log n)，全程迭代 */
+function buildLcaIndex(g: PreparedGraph, tj: TarjanOutput): LcaIndex {
+  const { n, parentVertex, parentEdge, depth } = g;
+  const { isBridge, order } = tj;
+
+  // 桥前缀：按 DFS 发现序（父先于子）累加“父边是否为桥”
+  const bridgePrefix = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = order[i];
+    const p = parentVertex[v];
+    if (p !== -1) {
+      bridgePrefix[v] = bridgePrefix[p] + isBridge[parentEdge[v]];
+    }
+  }
+
+  // 二进制提升：up[0][v] = 父顶点（根指向自身），up[k][v] = up[k-1][up[k-1][v]]
+  const levels = Math.max(1, 32 - Math.clz32(n - 1));
+  const up = new Int32Array(levels * n);
+  for (let v = 0; v < n; v++) {
+    const p = parentVertex[v];
+    up[v] = p === -1 ? v : p;
+  }
+  for (let k = 1; k < levels; k++) {
+    const prev = (k - 1) * n;
+    const cur = k * n;
+    for (let v = 0; v < n; v++) {
+      up[cur + v] = up[prev + up[prev + v]];
+    }
+  }
+  return { depth, bridgePrefix, up, levels };
+}
+
+/** 迭代式最近公共祖先（二进制提升），不占用递归调用栈 */
+function lcaOf(idx: LcaIndex, u0: number, v0: number): number {
+  const { depth, up, levels } = idx;
+  const n = depth.length;
+  let u = u0;
+  let v = v0;
+  if (depth[u] < depth[v]) {
+    const t = u;
+    u = v;
+    v = t;
+  }
+  // 将较深一端提升到同深
+  let diff = depth[u] - depth[v];
+  let k = 0;
+  while (diff !== 0) {
+    if ((diff & 1) !== 0) u = up[k * n + u];
+    diff >>>= 1;
+    k++;
+  }
+  if (u === v) return u;
+  // 自高向低同步提升，直到二者父顶点相同
+  for (let j = levels - 1; j >= 0; j--) {
+    const uu = up[j * n + u];
+    const vv = up[j * n + v];
+    if (uu !== vv) {
+      u = uu;
+      v = vv;
+    }
+  }
+  return up[u];
 }
 
 /** 一次导入对应的完整分析器；基线结果在构造时固定，试接不可改写它。 */
 export class Analyzer {
   private readonly g: PreparedGraph;
   private readonly tj: TarjanOutput;
+  /** 只读批量索引（桥前缀 + 二进制提升表），构造时一次建成 */
+  private readonly lca: LcaIndex;
   readonly baseline: BaselineResult;
 
   constructor(private readonly t: NormalizedTopology) {
     this.g = prepare(t);
     this.tj = tarjanBridges(this.g, t.links.length);
+    this.lca = buildLcaIndex(this.g, this.tj);
     this.baseline = this.buildBaseline();
   }
 
@@ -222,6 +317,60 @@ export class Analyzer {
     removed.sort((p, q) => compareUtf8(p.id, q.id));
 
     return { a, b, stillFragile, removed, baselineCount: this.baseline.bridges.length };
+  }
+
+  /**
+   * 批量方案筛选：对整批端点对给出各自可消除的基线桥数量（不展开链路清单）。
+   *
+   * 全批校验（端点存在且互异）全部通过后才开始计数，任一非法即按下标
+   * 抛出 TopologyError、不产生任何部分结果；成功时一次性返回整体结果。
+   * 每项计数 = bridgePrefix[u] + bridgePrefix[v] − 2·bridgePrefix[lca(u,v)]，
+   * 即试接 (u,v) 在桥树路径上覆盖的桥数，与 trial(u,v).removed.length 一致。
+   * 全程只读共享 LCA 索引：不循环调用 trial、不为单项分配链路长度缓冲、
+   * 不扫描全部链路，每项 O(log n)。
+   */
+  screenBatch(pairs: BatchPair[]): BatchScreenResult {
+    const count = pairs.length;
+    if (count === 0) {
+      throw new TopologyError('批量方案不能为空：至少包含 1 项端点对');
+    }
+    if (count > MAX_BATCH_PAIRS) {
+      throw new TopologyError(`批量方案项数超过上限 ${MAX_BATCH_PAIRS}，当前为 ${count}`);
+    }
+
+    // 第一遍：全批校验并解析端点下标；任何一项非法都按下标报错
+    const va = new Int32Array(count);
+    const vb = new Int32Array(count);
+    for (let i = 0; i < count; i++) {
+      const { a, b } = pairs[i];
+      if (a === b) {
+        throw new TopologyError(`批量方案下标 ${i}：两个端点必须不同（均为 ${JSON.stringify(a)}），不得构成自环`);
+      }
+      const ia = this.g.siteIndex.get(a);
+      const ib = this.g.siteIndex.get(b);
+      if (ia === undefined || ib === undefined) {
+        const missing = ia === undefined ? a : b;
+        throw new TopologyError(`批量方案下标 ${i}：端点 ${JSON.stringify(missing)} 不在当前站点清单中`);
+      }
+      va[i] = ia;
+      vb[i] = ib;
+    }
+
+    // 第二遍：校验全部通过后，基于只读索引批量计数（重复候选按原序保留）
+    const { bridgePrefix } = this.lca;
+    const items: BatchScreenItem[] = new Array(count);
+    for (let i = 0; i < count; i++) {
+      const u = va[i];
+      const v = vb[i];
+      const w = lcaOf(this.lca, u, v);
+      items[i] = {
+        index: i,
+        a: pairs[i].a,
+        b: pairs[i].b,
+        removedCount: bridgePrefix[u] + bridgePrefix[v] - 2 * bridgePrefix[w],
+      };
+    }
+    return { items, baselineCount: this.baseline.bridges.length };
   }
 }
 
