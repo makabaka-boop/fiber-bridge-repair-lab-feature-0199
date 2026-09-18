@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { BridgeInfo } from '../core/types';
+import type { BatchItemResult, BridgeInfo } from '../core/types';
 
 const PAGE_SIZE = 50;
 
@@ -76,8 +76,7 @@ export function BridgeTable({
   rows: BridgeInfo[];
   offset?: number;
   showSmallerSide?: boolean;
-}) {
-  return (
+}) {  return (
     <div className="table-wrap">
       <table className="bridge-table">
         <thead>
@@ -97,6 +96,34 @@ export function BridgeTable({
                 {b.u} <span className="dash">–</span> {b.v}
               </td>
               {showSmallerSide && <td className="num strong">{b.smallerSide.toLocaleString('zh-CN')}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** 批量方案筛选结果表：仅端点对与可消除桥数，不展开链路清单 */
+export function BatchTable({ rows }: { rows: BatchItemResult[] }) {
+  return (
+    <div className="table-wrap">
+      <table className="bridge-table batch-table" aria-label="批量筛选结果">
+        <thead>
+          <tr>
+            <th className="col-rank">下标</th>
+            <th>端点 A</th>
+            <th>端点 B</th>
+            <th className="col-side">可消除基线脆弱链路数</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.index}>
+              <td className="muted">{r.index}</td>
+              <td className="mono">{r.a}</td>
+              <td className="mono">{r.b}</td>
+              <td className="num strong">{r.removedCount.toLocaleString('zh-CN')}</td>
             </tr>
           ))}
         </tbody>

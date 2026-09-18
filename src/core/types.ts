@@ -48,6 +48,24 @@ export interface BaselineResult {
   bridges: BridgeInfo[];
 }
 
+/** 批量方案筛选：单项候选结论（只计数，不展开链路清单） */
+export interface BatchItemResult {
+  /** 输入下标（0 起；重复候选按原序保留，各自携带自己的下标） */
+  index: number;
+  a: string;
+  b: string;
+  /** 试接该端点对可消除的基线脆弱链路（桥）数量 */
+  removedCount: number;
+}
+
+/** 批量筛选整体结论：全批校验通过后一次性生成并整体提交 */
+export interface BatchResult {
+  /** 与输入同序（含重复候选）的单项结论 */
+  items: BatchItemResult[];
+  /** 基线脆弱链路总数（核对用） */
+  baselineCount: number;
+}
+
 /** 试接一条虚拟备纤后的结论 */
 export interface TrialResult {
   a: string;

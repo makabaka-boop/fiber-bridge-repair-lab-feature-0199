@@ -2,9 +2,9 @@ import { useCallback, useMemo, useState } from 'react';
 import { Analyzer } from '../core/analysis';
 import { parseTopology } from '../core/parse';
 import { TopologyError } from '../core/types';
-import type { BaselineResult, NormalizedTopology, TrialResult } from '../core/types';
+import type { BaselineResult, BatchResult, NormalizedTopology, TrialResult } from '../core/types';
 import { sampleTopology } from './sample';
-import { BridgeTable, Pagination, usePagination } from './BridgeTable';
+import { BatchTable, BridgeTable, Pagination, usePagination } from './BridgeTable';
 
 interface ValidState {
   topology: NormalizedTopology;
@@ -22,6 +22,12 @@ interface TrialState {
   b: string;
 }
 
+interface BatchState {
+  /** 上次成功批量筛选结果；非法批量时保留不变 */
+  result: BatchResult | null;
+  error: string | null;
+}
+
 export function App() {
   const [valid, setValid] = useState<ValidState | null>(null);
   const [rawText, setRawText] = useState('');
@@ -30,6 +36,7 @@ export function App() {
   const [fileName, setFileName] = useState<string | null>(null);
 
   const [trial, setTrial] = useState<TrialState | null>(null);
+  const [batch, setBatch] = useState<BatchState | null>(null);
 
   const loadTopology = useCallback((text: string, label: string | null) => {
     setImporting(true);
@@ -46,11 +53,13 @@ export function App() {
         });
         setImportError(null);
         setFileName(label);
-        // 新拓扑导入后旧试接不再适用，清空（基线本身不受历史试接影响）
+        // 合法新拓扑导入后旧试接与旧批量结果不再适用，清空
+        // （基线本身不受历史试接/批量影响）
         setTrial(null);
+        setBatch(null);
       } catch (e) {
         const msg = e instanceof TopologyError ? e.message : `分析失败：${(e as Error).message}`;
-        setImportError(msg); // 保留 valid（上次有效拓扑）不变
+        setImportError(msg); // 非法导入：保留 valid、试接与批量结果不变
       } finally {
         setImporting(false);
       }
@@ -85,6 +94,24 @@ export function App() {
       const msg = e instanceof TopologyError ? e.message : `试接失败：${(e as Error).message}`;
       // 非法试接：保留上次试接结果（若有），仅更新错误与当前输入
       setTrial((prev) => ({ result: prev?.result ?? null, error: msg, a, b }));
+    }
+  };
+
+  const onBatch = (text: string) => {
+    if (!valid) return;
+    if (text.trim() === '') {
+      setBatch((prev) => ({ result: prev?.result ?? null, error: '批量方案为空，请粘贴 JSON 数组' }));
+      return;
+    }
+    try {
+      // 核心接口全批校验通过后才生成结果，这里一次提交给 React
+      const result = valid.analyzer.batch(text);
+      // 成功：整体替换旧批量结果（基线与单次试接结果不受影响）
+      setBatch({ result, error: null });
+    } catch (e) {
+      const msg = e instanceof TopologyError ? e.message : `批量筛选失败：${(e as Error).message}`;
+      // 非法批量：保留上次批量结果（若有），仅更新错误
+      setBatch((prev) => ({ result: prev?.result ?? null, error: msg }));
     }
   };
 
@@ -161,6 +188,11 @@ export function App() {
             trial={trial}
             onSubmit={onTrial}
             onDismissError={() => setTrial((p) => (p ? { ...p, error: null } : p))}
+          />
+          <BatchSection
+            batch={batch}
+            onSubmit={onBatch}
+            onDismissError={() => setBatch((p) => (p ? { ...p, error: null } : p))}
           />
         </>
       )}
@@ -320,5 +352,68 @@ function Stat({ label, value }: { label: string; value: number }) {
       <span className="stat-value">{value.toLocaleString('zh-CN')}</span>
       <span className="stat-label">{label}</span>
     </div>
+  );
+}
+
+function BatchSection({
+  batch,
+  onSubmit,
+  onDismissError,
+}: {
+  batch: BatchState | null;
+  onSubmit: (text: string) => void;
+  onDismissError: () => void;
+}) {
+  const [text, setText] = useState('');
+
+  // 仅当存在成功批量结果时展示；非法批量时 result 保持为上次结果
+  const result = batch?.result ?? null;
+  const page = usePagination(result?.items.length ?? 0, 'batch');
+
+  return (
+    <section className="card">
+      <h2>4. 批量方案筛选</h2>
+      <p className="hint">
+        粘贴 <strong>1–100000</strong> 项的 JSON 数组，每项仅含 <code>a</code>、<code>b</code>{' '}
+        两个站点编号（规则同单次试接）。整批先校验结构、字段、端点存在且互异，
+        <strong>任一项非法即按下标报错、整批拒绝并保留上次结果</strong>；成功后按
+        <strong>输入下标</strong>分页展示每个端点对可消除的基线脆弱链路数量（不展开链路清单）。
+      </p>
+      <textarea
+        className="json-input"
+        aria-label="批量方案 JSON 输入"
+        rows={4}
+        placeholder='[{"a":"site-0","b":"site-5"}, {"a":"site-1","b":"site-9"}]'
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+      />
+      <div className="row">
+        <button className="primary" onClick={() => onSubmit(text)}>
+          批量筛选
+        </button>
+      </div>
+
+      {batch?.error && (
+        <div className="alert error" role="alert">
+          <strong>批量筛选被拒绝。</strong> {result ? '上次批量结果保留如下。' : '尚无有效批量结果。'}
+          <div className="alert-detail">{batch.error}</div>
+          <button className="link" onClick={onDismissError}>
+            关闭提示
+          </button>
+        </div>
+      )}
+
+      {result && (
+        <div className="batch-result">
+          <div className="stat-row">
+            <Stat label="候选方案数" value={result.items.length} />
+            <Stat label="基线脆弱链路总数" value={result.baselineCount} />
+          </div>
+          <BatchTable rows={result.items.slice(page.start, page.end)} />
+          <Pagination page={page} total={result.items.length} />
+        </div>
+      )}
+    </section>
   );
 }

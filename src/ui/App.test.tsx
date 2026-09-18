@@ -1,5 +1,5 @@
 /// <reference types="vitest/globals" />
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { App } from './App';
 
@@ -40,6 +40,18 @@ async function submitTrial(a: string, b: string) {
   });
   fireEvent.click(trialButton());
 }
+
+const batchBox = () => screen.getByLabelText('批量方案 JSON 输入') as HTMLTextAreaElement;
+const batchTable = () => screen.getByRole('table', { name: '批量筛选结果' });
+
+async function submitBatch(text: string) {
+  fireEvent.change(batchBox(), { target: { value: text } });
+  await waitFor(() => expect(batchBox().value).toBe(text));
+  fireEvent.click(screen.getByRole('button', { name: '批量筛选' }));
+}
+
+/** 批量结果表的数据行（不含表头） */
+const batchRows = () => within(batchTable()).getAllByRole('row').slice(1);
 
 afterEach(cleanup);
 
@@ -121,5 +133,66 @@ describe('拓扑工作台 UI', () => {
     // 旧基线依旧保留（脆弱链路总数统计卡仍为 2，桥行仍在）
     expect(fragileStatValue()).toBe('2');
     expect(screen.getByText('L2')).toBeTruthy();
+  });
+
+  it('批量方案筛选：成功整体替换、末项非法无部分结果、新拓扑清空', async () => {
+    render(<App />);
+    await importJson(validJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    // 合法批量：a-c 消除 2 座桥，b-c 消除 1 座，重复候选按原序保留
+    await submitBatch(JSON.stringify([{ a: 'a', b: 'c' }, { a: 'b', b: 'c' }, { a: 'a', b: 'c' }]));
+    await waitFor(() => expect(screen.getByText('候选方案数')).toBeTruthy());
+    let rows = batchRows();
+    expect(rows).toHaveLength(3);
+    const cellsOf = (row: HTMLElement) => within(row).getAllByRole('cell').map((c) => c.textContent);
+    expect(cellsOf(rows[0])).toEqual(['0', 'a', 'c', '2']);
+    expect(cellsOf(rows[1])).toEqual(['1', 'b', 'c', '1']);
+    expect(cellsOf(rows[2])).toEqual(['2', 'a', 'c', '2']);
+
+    // 末项非法：按下标报错、无部分结果，上次批量结果保留
+    await submitBatch(JSON.stringify([{ a: 'a', b: 'c' }, { a: 'a', b: 'ghost' }]));
+    await waitFor(() => expect(screen.getByText('批量筛选被拒绝。')).toBeTruthy());
+    expect(screen.getByText(/下标 1/)).toBeTruthy();
+    expect(screen.getByText(/不在当前站点清单/)).toBeTruthy();
+    expect(batchRows()).toHaveLength(3);
+    expect(cellsOf(batchRows()[0])).toEqual(['0', 'a', 'c', '2']);
+    // 基线与单次试接结果不受影响
+    expect(fragileStatValue()).toBe('2');
+
+    // 额外字段 / 空批次 / 相同端点均整体拒绝
+    await submitBatch(JSON.stringify([{ a: 'a', b: 'c', note: 1 }]));
+    await waitFor(() => expect(screen.getByText(/额外字段/)).toBeTruthy());
+    expect(batchRows()).toHaveLength(3);
+    await submitBatch('[]');
+    await waitFor(() => expect(screen.getByText(/不能为空数组/)).toBeTruthy());
+    await submitBatch(JSON.stringify([{ a: 'b', b: 'b' }]));
+    await waitFor(() => expect(screen.getByText(/必须不同/)).toBeTruthy());
+    expect(batchRows()).toHaveLength(3);
+
+    // 非法导入：保留上次有效拓扑与批量结果
+    await importJson('{坏的');
+    await waitFor(() => expect(screen.getByText('导入被拒绝，')).toBeTruthy());
+    expect(batchRows()).toHaveLength(3);
+
+    // 合法新拓扑：清空旧批量结果（基线随之更新）
+    await importJson(
+      JSON.stringify({
+        sites: ['x', 'y'],
+        links: [{ id: 'R1', u: 'x', v: 'y' }],
+      }),
+    );
+    await waitFor(() => expect(fragileStatValue()).toBe('1'));
+    expect(screen.queryByText('候选方案数')).toBeNull();
+    expect(screen.queryByRole('table', { name: '批量筛选结果' })).toBeNull();
+
+    // 新拓扑下可重新批量筛选（单次试接明细保持兼容）
+    await submitBatch(JSON.stringify([{ a: 'x', b: 'y' }]));
+    await waitFor(() => expect(screen.getByText('候选方案数')).toBeTruthy());
+    rows = batchRows();
+    expect(rows).toHaveLength(1);
+    expect(cellsOf(rows[0])).toEqual(['0', 'x', 'y', '1']);
+    await submitTrial('x', 'y');
+    await waitFor(() => expect(screen.getByText(/已消除 1 条/)).toBeTruthy());
   });
 });
